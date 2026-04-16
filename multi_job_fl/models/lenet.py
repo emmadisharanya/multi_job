@@ -1,73 +1,60 @@
 """
-LeNet-5 for MNIST
+LeNet-5 — exact LeCun 1998 architecture for MNIST (28×28, 1-channel).
+
+Original paper: "Gradient-Based Learning Applied to Document Recognition"
+                LeCun et al., 1998.
+
+Architecture (faithful to original):
+    C1  : Conv2d(1,  6,  5×5, pad=2) → Tanh   [pad=2 keeps 28→28]
+    S2  : AvgPool2d(2×2, stride=2)             [28→14]
+    C3  : Conv2d(6,  16, 5×5)        → Tanh   [14→10]
+    S4  : AvgPool2d(2×2, stride=2)             [10→5]
+    C5  : Linear(400, 120)           → Tanh   [5×5×16=400]
+    F6  : Linear(120, 84)            → Tanh
+    Out : Linear(84,  num_classes)
+
+Key authenticity notes:
+  - Tanh activations (NOT ReLU) — this is what makes it LeNet-5
+  - AvgPool (NOT MaxPool) — faithful to the 1998 paper
+  - padding=2 on first conv so 28×28 input works (original was 32×32)
+
+Paper target accuracy: ~99% on MNIST (non-IID FL setting ~96-98%)
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 class LeNet5(nn.Module):
-    """
-    LeNet-5 architecture for MNIST
-    
-    Original paper: LeCun et al., 1998
-    
-    Architecture:
-    - Conv1: 1->6 channels, 5x5 kernel
-    - Conv2: 6->16 channels, 5x5 kernel
-    - FC1: 120 units
-    - FC2: 84 units
-    - FC3: 10 classes (output)
-    """
-    
     def __init__(self, num_classes=10):
         super(LeNet5, self).__init__()
-        
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 6, kernel_size=5)
-        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(16 * 4 * 4, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, num_classes)
-        
-        # Pooling
-        self.pool = nn.AvgPool2d(2, 2)
-    
+
+        self.features = nn.Sequential(
+            # C1: 1 → 6 feature maps, 5×5 kernel, pad=2 to preserve 28×28
+            nn.Conv2d(1, 6, kernel_size=5, padding=2),   # 28×28 → 28×28
+            nn.Tanh(),
+            # S2: 2×2 average pooling
+            nn.AvgPool2d(kernel_size=2, stride=2),        # 28×28 → 14×14
+
+            # C3: 6 → 16 feature maps, 5×5 kernel, no padding
+            nn.Conv2d(6, 16, kernel_size=5),              # 14×14 → 10×10
+            nn.Tanh(),
+            # S4: 2×2 average pooling
+            nn.AvgPool2d(kernel_size=2, stride=2),        # 10×10 → 5×5
+        )
+
+        self.classifier = nn.Sequential(
+            # C5 (treated as FC in modern impl): 16×5×5=400 → 120
+            nn.Linear(16 * 5 * 5, 120),
+            nn.Tanh(),
+            # F6
+            nn.Linear(120, 84),
+            nn.Tanh(),
+            # Output
+            nn.Linear(84, num_classes),
+        )
+
     def forward(self, x):
-        # Conv block 1: 28x28 -> 24x24 -> 12x12
-        x = self.pool(F.relu(self.conv1(x)))
-        
-        # Conv block 2: 12x12 -> 8x8 -> 4x4
-        x = self.pool(F.relu(self.conv2(x)))
-        
-        # Flatten
-        x = x.view(-1, 16 * 4 * 4)
-        
-        # Fully connected
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        
+        x = self.features(x)
+        x = x.view(x.size(0), -1)   # flatten: 16×5×5 = 400
+        x = self.classifier(x)
         return x
-
-
-# Test
-if __name__ == "__main__":
-    print("Testing LeNet5\n")
-    
-    model = LeNet5(num_classes=10)
-    
-    # Test with random input (batch of 4 MNIST images)
-    x = torch.randn(4, 1, 28, 28)
-    output = model(x)
-    
-    print(f"Model: {model.__class__.__name__}")
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
-    
-    print("\nLeNet model working correctly!")
