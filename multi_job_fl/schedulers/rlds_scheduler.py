@@ -1,25 +1,13 @@
 #!/usr/bin/env python
 """
-Multi-Job Federated Learning — Random Scheduler Baseline
-=========================================================
+Multi-Job Federated Learning — RLDS Scheduler
+==============================================
 Reproduces the experimental setup of:
   "Efficient Device Scheduling with Multi-Job Federated Learning"
   Zhou et al., AAAI 2022  (arXiv:2112.05928)
 
-Setup (matching paper Table 1 / Section 5):
-  - 100 devices total
-  - 10 devices selected per round per job
-  - Non-IID partition: 2 classes per device (Dirichlet-like)
-  - Local training: 5 epochs, batch size 64, SGD lr=0.01
-  - FedAvg aggregation
-
-Jobs (paper Section 5 experimental config):
-  Job 0 : ResNet-18  + CIFAR-10  (3-ch, 32×32)  — target 80% (paper) / ~52% FL non-IID
-  Job 1 : LeNet-5    + MNIST     (1-ch, 28×28)  — target 99% (paper) / ~98% FL non-IID
-  Job 2 : AlexNet    + MNIST     (1-ch, 28×28)  — target 99% (paper) / ~99% FL non-IID
-
-Target accuracies used here are the FL non-IID convergence targets that
-reproduce the relative speedup results from the paper.
+Identical setup to run_random_improved.py — only the scheduler differs.
+See that file for full hyperparameter commentary.
 """
 
 import os
@@ -40,17 +28,17 @@ from models.alexnet import AlexNet
 from federated.client import FLClient
 from federated.server import FLServer
 from data.non_iid_partition import create_non_iid_datasets
+from schedulers.multijob_rlds import MultiJobRLDSScheduler
 
-# ── Live plot support (graceful fallback if display unavailable) ─────────────
+# ── Live plot support ────────────────────────────────────────────────────────
 try:
     import matplotlib
-    matplotlib.use('Agg')          # works on headless servers / Kaggle
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     PLOT_AVAILABLE = True
 except ImportError:
     PLOT_AVAILABLE = False
 
-# ── Global plot state ────────────────────────────────────────────────────────
 _fig = _axes = None
 _acc_history  = {0: [], 1: [], 2: []}
 _loss_history = {0: [], 1: [], 2: []}
@@ -64,7 +52,7 @@ def setup_plots():
         return
     plt.ion()
     _fig, _axes = plt.subplots(1, 2, figsize=(14, 5))
-    _fig.suptitle('Random Scheduler — Training Progress', fontsize=13)
+    _fig.suptitle('RLDS Scheduler — Training Progress', fontsize=13)
     for ax, title, ylabel in [
         (_axes[0], 'Test Accuracy per Round',  'Accuracy (%)'),
         (_axes[1], 'Test Loss per Round',       'Loss'),
@@ -104,7 +92,7 @@ def save_plots(out_dir='/kaggle/working'):
     if not PLOT_AVAILABLE or _fig is None:
         return
     plt.ioff()
-    path = os.path.join(out_dir, 'random_training_curves.png')
+    path = os.path.join(out_dir, 'rlds_training_curves.png')
     _fig.savefig(path, dpi=150, bbox_inches='tight')
     print(f'  Plot saved → {path}')
 
@@ -112,10 +100,9 @@ def save_plots(out_dir='/kaggle/working'):
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print('=' * 70)
-    print('MULTI-JOB RANDOM SCHEDULER  (paper: Zhou et al. AAAI-22)')
+    print('MULTI-JOB RLDS SCHEDULER  (paper: Zhou et al. AAAI-22)')
     print('=' * 70)
 
-    # ── Reproducibility ──────────────────────────────────────────────────────
     SEED = 42
     torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
     if torch.cuda.is_available():
@@ -124,22 +111,19 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'\nDevice : {device}')
 
-    # ── Hyperparameters (matching paper Section 5) ───────────────────────────
-    NUM_DEVICES      = 100   # total devices  (paper: 100)
-    DEVICES_PER_ROUND = 10   # selected / round / job  (paper: 10)
-    LOCAL_EPOCHS     = 5     # local SGD epochs  (paper: 5)
-    BATCH_SIZE       = 64    # local batch size  (paper: 64)
-    LEARNING_RATE    = 0.01  # SGD lr  (paper: 0.01)
-    MAX_ROUNDS       = 800   # safety cap
+    # ── Hyperparameters — identical to Random baseline ────────────────────────
+    NUM_DEVICES       = 100
+    DEVICES_PER_ROUND = 10
+    LOCAL_EPOCHS      = 5
+    BATCH_SIZE        = 64
+    LEARNING_RATE     = 0.01
+    MAX_ROUNDS        = 800
 
-    # ── Job configuration (paper Section 5) ──────────────────────────────────
-    # Format: model_key, dataset, in_channels, input_size, target_acc
-    #
-    # Target accuracies are the FL non-IID convergence thresholds that
-    # replicate the paper's relative timing results.
-    #   Job 0 ResNet18+CIFAR10 : paper reports ~80% standalone; FL non-IID ~52%
-    #   Job 1 LeNet5+MNIST     : paper reports ~99% standalone; FL non-IID ~98%
-    #   Job 2 AlexNet+MNIST    : paper reports ~99% standalone; FL non-IID ~99%
+    # ── Paper cost-model weights (Formula 2 in paper) ────────────────────────
+    ALPHA = 0.3   # weight of time cost
+    BETA  = 0.7   # weight of fairness cost
+
+    # ── Job configuration — SAME as Random baseline ───────────────────────────
     JOBS = {
         0: ('resnet18', 'cifar10', 3, 32, 52.0),
         1: ('lenet5',   'mnist',   1, 28, 98.0),
@@ -186,11 +170,35 @@ def main():
     # ── Clients ───────────────────────────────────────────────────────────────
     print(f'\nCreating {NUM_DEVICES} clients per job...')
     clients = {}
+    device_caps = {}
+    rng = np.random.default_rng(SEED)
+    for d in range(NUM_DEVICES):
+        # Device capability drawn from the shift-exponential model (paper Eq. 4)
+        # a_k ~ Uniform(0.5, 2.0),  μ_k ~ Uniform(0.1, 1.0)
+        device_caps[d] = {
+            'capability':  float(rng.uniform(0.5, 2.0)),
+            'fluctuation': float(rng.uniform(0.1, 1.0)),
+        }
     for j in range(3):
         clients[j] = {
             d: FLClient(d, job_client_datasets[j][d], BATCH_SIZE, LEARNING_RATE, device)
             for d in range(NUM_DEVICES)
         }
+
+    # ── RLDS Scheduler ────────────────────────────────────────────────────────
+    print('\nInitialising RLDS scheduler...')
+    scheduler = MultiJobRLDSScheduler(
+        num_devices=NUM_DEVICES,
+        devices_per_round=DEVICES_PER_ROUND,
+        num_jobs=3,
+        device_capabilities=device_caps,
+        alpha=ALPHA,
+        beta=BETA,
+        epsilon=0.3,     # ε-greedy exploration rate
+        gamma=0.9,       # baseline EMA decay
+        learning_rate=1e-3,
+    )
+    print('  RLDS ready')
 
     # ── Training loop ─────────────────────────────────────────────────────────
     print('\n' + '=' * 70)
@@ -199,31 +207,32 @@ def main():
 
     setup_plots()   # ◄── live plots initialised HERE (before loop)
 
-    job_done   = {0: False, 1: False, 2: False}
-    job_times  = {0: 0.0,   1: 0.0,   2: 0.0}
-    job_rounds = {0: 0,     1: 0,     2: 0}
-    job_final_acc = {0: 0.0, 1: 0.0, 2: 0.0}
+    job_done      = {0: False, 1: False, 2: False}
+    job_times     = {0: 0.0,   1: 0.0,   2: 0.0}
+    job_rounds    = {0: 0,     1: 0,     2: 0}
+    job_final_acc = {0: 0.0,   1: 0.0,   2: 0.0}
 
-    # Log for saving to disk
     log = {j: {'rounds': [], 'acc': [], 'loss': []} for j in range(3)}
 
     global_start = time.time()
-    round_num = 0
+    round_num    = 0
 
-    with tqdm(total=MAX_ROUNDS, desc='Random') as pbar:
+    with tqdm(total=MAX_ROUNDS, desc='RLDS') as pbar:
         while not all(job_done.values()) and round_num < MAX_ROUNDS:
             round_num += 1
-            occupied = set()
+            round_start = time.time()
+
+            # ── RLDS device assignment ────────────────────────────────────────
+            assignments = scheduler.select_devices_for_all_jobs()
+
+            round_accs = []
 
             for j in range(3):
                 if job_done[j]:
+                    round_accs.append(JOBS[j][4])
                     continue
 
-                # ── Device selection: uniform random (Random baseline) ────────
-                available = [d for d in range(NUM_DEVICES) if d not in occupied]
-                rng = random.Random(SEED + round_num * 10 + j)
-                selected = rng.sample(available, min(DEVICES_PER_ROUND, len(available)))
-                occupied.update(selected)
+                selected = assignments[j]
 
                 # ── Local training + FedAvg aggregation ──────────────────────
                 local_updates = [
@@ -238,6 +247,7 @@ def main():
                 acc  = result['test_accuracy']
                 loss = result['test_loss']
                 job_final_acc[j] = acc
+                round_accs.append(acc)
 
                 # ── ▼▼▼ LIVE PLOT UPDATE — called every round ▼▼▼ ────────────
                 update_plots(j, job_rounds[j], acc, loss)
@@ -256,6 +266,12 @@ def main():
                           f' at round {job_rounds[j]}'
                           f' ({job_times[j]/60:.1f} min)')
 
+            # ── RLDS policy update ────────────────────────────────────────────
+            time_cost = time.time() - round_start
+            scheduler.update_selections(assignments)
+            reward = scheduler.compute_reward(round_accs, time_cost)
+            scheduler.update_policy(reward, assignments)
+
             pbar.update(1)
             if round_num % 20 == 0:
                 status = [f'J{j}:{job_final_acc[j]:.1f}%'
@@ -266,7 +282,7 @@ def main():
     save_plots()   # ◄── save final plot
 
     # ── Save log ──────────────────────────────────────────────────────────────
-    log_path = '/kaggle/working/random_log.json'
+    log_path = '/kaggle/working/rlds_log.json'
     try:
         with open(log_path, 'w') as f:
             json.dump(log, f)
@@ -274,10 +290,13 @@ def main():
     except Exception:
         pass
 
+    # ── Fairness stats ────────────────────────────────────────────────────────
+    stats = scheduler.get_stats()
+
     # ── Results ───────────────────────────────────────────────────────────────
     total_time = sum(job_times.values())
     print('\n' + '=' * 70)
-    print('RANDOM RESULTS')
+    print('RLDS RESULTS')
     print('=' * 70)
     print(f'{"Job":<6} {"Model+Dataset":<26} {"Time (min)":>12} {"Rounds":>8} {"Acc":>8}')
     print('-' * 70)
@@ -288,6 +307,11 @@ def main():
               f'{job_final_acc[j]:>6.2f}%')
     print('-' * 70)
     print(f'  Total time: {total_time/60:.1f} min  ({total_time/3600:.2f} h)')
+
+    print('\nFairness (σ of per-device selection counts):')
+    for j in range(3):
+        print(f'  Job {j}: σ={stats[j]["std"]:.2f}  '
+              f'min={stats[j]["min"]}  max={stats[j]["max"]}')
     print('=' * 70)
 
 
