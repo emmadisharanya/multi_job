@@ -35,11 +35,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.resnet  import ResNet18
-from models.lenet   import LeNet5
+from models.cnn_b   import CNNB
 from models.alexnet import AlexNet
 from federated.client import FLClient
 from federated.server import FLServer
-from data.non_iid_partition import create_non_iid_datasets
+from models.non_iid_partition import create_non_iid_datasets
 
 # ── Live plot support (graceful fallback if display unavailable) ─────────────
 try:
@@ -55,8 +55,8 @@ _fig = _axes = None
 _acc_history  = {0: [], 1: [], 2: []}
 _loss_history = {0: [], 1: [], 2: []}
 _round_history = {0: [], 1: [], 2: []}
-_JOB_COLORS = ['tab:blue', 'tab:orange', 'tab:green']
-_JOB_NAMES  = ['ResNet18+CIFAR10', 'LeNet5+MNIST', 'AlexNet+MNIST']
+_JOB_COLORS = {0: 'tab:blue', 1: 'tab:orange', 2: 'tab:green'}
+_JOB_NAMES  = {0: 'Job 0', 1: 'Job 1', 2: 'Job 2'}
 
 def setup_plots():
     global _fig, _axes
@@ -100,13 +100,15 @@ def update_plots(job_id, round_num, acc, loss):
     _fig.canvas.draw()
     _fig.canvas.flush_events()
 
-def save_plots(out_dir='/kaggle/working'):
-    if not PLOT_AVAILABLE or _fig is None:
+
+def save_plots():
+    if _fig is None:
         return
-    plt.ioff()
-    path = os.path.join(out_dir, 'random_training_curves.png')
+    import os
+    os.makedirs('results', exist_ok=True)
+    path = 'results/random_training_curves.png'
     _fig.savefig(path, dpi=150, bbox_inches='tight')
-    print(f'  Plot saved → {path}')
+    print(f'Plot saved to {path}')
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -128,9 +130,9 @@ def main():
     NUM_DEVICES      = 100   # total devices  (paper: 100)
     DEVICES_PER_ROUND = 10   # selected / round / job  (paper: 10)
     LOCAL_EPOCHS     = 5     # local SGD epochs  (paper: 5)
-    BATCH_SIZE       = 64    # local batch size  (paper: 64)
-    LEARNING_RATE    = 0.01  # SGD lr  (paper: 0.01)
-    MAX_ROUNDS       = 800   # safety cap
+    BATCH_SIZE       = {0: 30, 1: 10, 2: 64}    # local batch size  (paper: 64)
+    LEARNING_RATE    = {0: 0.1, 1: 0.01, 2: 0.01}  # SGD lr  (paper: 0.01)
+    MAX_ROUNDS       = 5000   # safety cap
 
     # ── Job configuration (paper Section 5) ──────────────────────────────────
     # Format: model_key, dataset, in_channels, input_size, target_acc
@@ -141,13 +143,13 @@ def main():
     #   Job 1 LeNet5+MNIST     : paper reports ~99% standalone; FL non-IID ~98%
     #   Job 2 AlexNet+MNIST    : paper reports ~99% standalone; FL non-IID ~99%
     JOBS = {
-        0: ('resnet18', 'cifar10', 3, 32, 52.0),
-        1: ('lenet5',   'mnist',   1, 28, 98.0),
-        2: ('alexnet',  'mnist',   1, 28, 99.0),
+        0: ('resnet18', 'cifar10', 3, 32, 54.6),
+        1: ('cnn_b',   'fashion_mnist',   1, 28, 82.1),
+        2: ('alexnet',  'mnist',   1, 28, 98.9),
     }
     JOB_NAMES = {
         0: 'ResNet18 + CIFAR-10',
-        1: 'LeNet-5  + MNIST',
+        1: 'CNN  + FashionMNIST',
         2: 'AlexNet  + MNIST',
     }
 
@@ -173,8 +175,8 @@ def main():
     for j, (model_key, _, ch, sz, _) in JOBS.items():
         if model_key == 'resnet18':
             model = ResNet18(num_classes=10, input_channels=ch)
-        elif model_key == 'lenet5':
-            model = LeNet5(num_classes=10)
+        elif model_key == 'cnn_b':
+            model = CNNB(num_classes=10)
         elif model_key == 'alexnet':
             model = AlexNet(num_classes=10, input_channels=ch, input_size=sz)
         else:
@@ -188,7 +190,7 @@ def main():
     clients = {}
     for j in range(3):
         clients[j] = {
-            d: FLClient(d, job_client_datasets[j][d], BATCH_SIZE, LEARNING_RATE, device)
+            d: FLClient(d, job_client_datasets[j][d], BATCH_SIZE[j], LEARNING_RATE[j], device)
             for d in range(NUM_DEVICES)
         }
 

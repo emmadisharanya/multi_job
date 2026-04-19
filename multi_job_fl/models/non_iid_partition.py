@@ -114,7 +114,7 @@ class NonIIDPartitioner:
         return Subset(self.dataset, indices)
 
 
-def create_non_iid_datasets(dataset_name='cifar10', num_devices=30, seed=42):
+def create_non_iid_datasets(dataset_name='cifar10', num_devices=30, seed=42 , num_classes_per_device=2):
     """
     Convenience function to create non-IID datasets
     
@@ -146,6 +146,18 @@ def create_non_iid_datasets(dataset_name='cifar10', num_devices=30, seed=42):
             root='./data', train=False, download=True, transform=transform
         )
         num_classes = 10
+    elif dataset_name == 'fashion_mnist':
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+        train_dataset = datasets.FashionMNIST(
+            root='./data', train=True, download=True, transform=transform
+        )
+        test_dataset = datasets.FashionMNIST(
+            root='./data', train=False, download=True, transform=transform
+        )
+        num_classes = 10
         
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
@@ -154,10 +166,9 @@ def create_non_iid_datasets(dataset_name='cifar10', num_devices=30, seed=42):
         train_dataset,
         num_devices=num_devices,
         num_classes=num_classes,
-        num_classes_per_device=2,
+        num_classes_per_device=num_classes_per_device,
         seed=seed
-    )
-    
+   )
     device_data = partitioner.partition()
     
     device_datasets = {}

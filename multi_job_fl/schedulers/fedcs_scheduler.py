@@ -1,255 +1,345 @@
 """
-FedCS: Federated Client Selection
+Multi-Job Federated Learning — FedCS Scheduler
+===============================================
+Reproduces the experimental setup of:
+  "Efficient Device Scheduling with Multi-Job Federated Learning"
+  Zhou et al., AAAI 2022  (arXiv:2112.05928)
 
-Greedy scheduler that selects fastest devices based on 
-estimated completion time.
+FedCS (Nishio & Yonetani, ICC 2019):
+  - Devices report capability (computation + communication)
+  - Server selects devices with capability-weighted probability
+  - Higher capability = higher chance of being selected
+  - Occupied devices excluded each round
 
-Reference: Nishio & Yonetani, "Client Selection for Federated 
-Learning with Heterogeneous Resources in Mobile Edge," ICC 2019
+Setup (matching paper Table 4 / Section 5):
+  - 100 devices total
+  - 10 devices selected per round per job
+  - Non-IID partition: 2 classes per device
+  - Local training: 5 epochs
+  - Batch sizes: ResNet=30, CNN-B=10, AlexNet=64
+  - Learning rates: ResNet=0.1, CNN-B=0.01, AlexNet=0.01
+  - FedAvg aggregation
+
+Jobs (Group B, paper Table 4):
+  Job 0 : ResNet-18  + CIFAR-10       target 54.6%
+  Job 1 : CNN-B      + Fashion-MNIST  target 82.1%
+  Job 2 : AlexNet    + MNIST          target 98.9%
 """
+import os
+import sys
+import time
+import random
+import json
+import torch
 import numpy as np
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models.resnet  import ResNet18
+from models.cnn_b   import CNNB
+from models.alexnet import AlexNet
+from federated.client import FLClient
+from federated.server import FLServer
+from models.non_iid_partition import create_non_iid_datasets
+
+# ── Live plot support ─────────────────────────────────────────────────────────
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    PLOT_AVAILABLE = True
+except ImportError:
+    PLOT_AVAILABLE = False
+
+# ── Global plot state ─────────────────────────────────────────────────────────
+_fig = _axes = None
+_acc_history   = {0: [], 1: [], 2: []}
+_loss_history  = {0: [], 1: [], 2: []}
+_round_history = {0: [], 1: [], 2: []}
+_JOB_COLORS = {0: 'tab:blue', 1: 'tab:orange', 2: 'tab:green'}
+_JOB_NAMES  = {0: 'ResNet18/CIFAR-10', 1: 'CNN-B/FashionMNIST', 2: 'AlexNet/MNIST'}
 
 
-class FedCSScheduler:
+def setup_plots():
+    global _fig, _axes
+    if not PLOT_AVAILABLE:
+        return
+    plt.ion()
+    _fig, _axes = plt.subplots(1, 2, figsize=(14, 5))
+    _fig.suptitle('FedCS Scheduler — Training Progress', fontsize=13)
+    for ax, title, ylabel in [
+        (_axes[0], 'Test Accuracy per Round', 'Accuracy (%)'),
+        (_axes[1], 'Test Loss per Round',      'Loss'),
+    ]:
+        ax.set_xlabel('Round'); ax.set_ylabel(ylabel); ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def update_plots(job_id, round_num, acc, loss):
+    _acc_history[job_id].append(acc)
+    _loss_history[job_id].append(loss)
+    _round_history[job_id].append(round_num)
+    if not PLOT_AVAILABLE or _axes is None:
+        return
+    _axes[0].cla(); _axes[1].cla()
+    for j in range(3):
+        if _round_history[j]:
+            _axes[0].plot(_round_history[j], _acc_history[j],
+                          color=_JOB_COLORS[j], label=_JOB_NAMES[j], lw=1.5)
+            _axes[1].plot(_round_history[j], _loss_history[j],
+                          color=_JOB_COLORS[j], label=_JOB_NAMES[j], lw=1.5)
+    for ax, ylabel in [(_axes[0], 'Accuracy (%)'), (_axes[1], 'Loss')]:
+        ax.set_xlabel('Round'); ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+    _axes[0].set_title('Test Accuracy per Round')
+    _axes[1].set_title('Test Loss per Round')
+    _fig.canvas.draw()
+    _fig.canvas.flush_events()
+
+
+def save_plots():
+    if _fig is None:
+        return
+    os.makedirs('results', exist_ok=True)
+    path = 'results/fedcs_training_curves.png'
+    _fig.savefig(path, dpi=150, bbox_inches='tight')
+    print(f'  Plot saved -> {path}')
+
+
+# ── FedCS Device Selector ─────────────────────────────────────────────────────
+class FedCSSelector:
     """
-    FedCS: Client Selection based on device capability
-    
-    Selects K fastest devices (lowest estimated completion time)
+    FedCS selects devices using capability-weighted probability sampling.
+    Higher capability devices are more likely to be selected but not
+    deterministically always the same ones — this matches the deadline
+    mechanism of the original FedCS paper where capable devices are
+    preferred but variety is maintained across rounds.
     """
-    
-    def __init__(self, num_devices, devices_per_round, device_capabilities, 
-                 seed=42):
-        """
-        Args:
-            num_devices: Total number of devices
-            devices_per_round: Number of devices to select (K)
-            device_capabilities: Dict of device capabilities from simulator
-                                {device_id: {'a_k': ..., 'mu_k': ...}}
-            seed: Random seed
-        """
-        self.num_devices = num_devices
+    def __init__(self, num_devices, devices_per_round, device_capabilities, seed=42):
+        self.num_devices       = num_devices
         self.devices_per_round = devices_per_round
-        self.device_capabilities = device_capabilities
-        self.seed = seed
-        
-        # Track selection history for fairness calculation
-        self.selection_history = {i: 0 for i in range(num_devices)}
-        
-        # Extract device speeds (a_k values)
-        self.device_speeds = {
-            i: device_capabilities[i]['a_k'] 
-            for i in range(num_devices)
-        }
-        
-        print(f"FedCS Scheduler initialized")
-        print(f"  Total devices: {num_devices}")
-        print(f"  Devices per round: {devices_per_round}")
-        print(f"  Selection strategy: Greedy (fastest devices)")
-    
-    def estimate_completion_time(self, device_id, dataset_size, 
-                                 model_size=1.0, tau_m=0.001):
-        """
-        Estimate time for device to complete one training round
-        
-        Simplified version of paper's formula:
-        time = computation_time + communication_time
-        
-        Args:
-            device_id: Device identifier
-            dataset_size: Number of samples on device
-            model_size: Size of model (for communication)
-            tau_m: Time coefficient for model complexity
-        
-        Returns:
-            float: Estimated completion time
-        """
-        a_k = self.device_speeds[device_id]
-        
-        # Computation time (proportional to dataset size and device speed)
-        computation_time = tau_m * a_k * dataset_size
-        
-        # Communication time (proportional to model size and device speed)
-        # Simplified: assume communication also affected by device capability
-        communication_time = model_size * a_k * 0.1
-        
-        total_time = computation_time + communication_time
-        
-        return total_time
-    
-    def select_devices(self, available_devices=None, dataset_sizes=None):
-        """
-        Select K fastest devices based on estimated completion time
-        
-        Args:
-            available_devices: List of available device IDs
-                             If None, all devices are available
-            dataset_sizes: Dict {device_id: dataset_size}
-                          If None, assume equal sizes (500 samples)
-        
-        Returns:
-            list: Selected device IDs (K fastest)
-        """
-        # If no available devices specified, use all
-        if available_devices is None:
-            available_devices = list(range(self.num_devices))
-        
-        # If no dataset sizes provided, assume equal
-        if dataset_sizes is None:
-            dataset_sizes = {i: 500 for i in available_devices}
-        
-        # Calculate estimated time for each available device
-        device_times = []
-        for device_id in available_devices:
-            dataset_size = dataset_sizes.get(device_id, 500)
-            est_time = self.estimate_completion_time(device_id, dataset_size)
-            device_times.append((device_id, est_time))
-        
-        # Sort by estimated time (ascending - fastest first)
-        device_times.sort(key=lambda x: x[1])
-        
-        # Select K fastest devices
-        k = min(self.devices_per_round, len(available_devices))
-        selected = [device_id for device_id, _ in device_times[:k]]
-        
-        # Update selection history
-        for device_id in selected:
-            self.selection_history[device_id] += 1
-        
+        self.capability = np.array([
+            device_capabilities[d]['capability']
+            for d in range(num_devices)
+        ])
+        self.selection_counts = {j: np.zeros(num_devices) for j in range(3)}
+        self.rng = np.random.default_rng(seed)
+
+    def select(self, job_id, occupied):
+        available = [d for d in range(self.num_devices) if d not in occupied]
+        if len(available) == 0:
+            return []
+
+        # Capability-weighted probability — higher capability = higher chance
+        caps = self.capability[available]
+        probs = caps / caps.sum()
+
+        n = min(self.devices_per_round, len(available))
+        selected = self.rng.choice(
+            available,
+            size=n,
+            replace=False,
+            p=probs
+        ).tolist()
+
+        for d in selected:
+            self.selection_counts[job_id][d] += 1
         return selected
-    
-    def get_fairness_score(self):
-        """
-        Calculate fairness score (standard deviation of selection frequency)
-        Lower is better (more fair)
-        
-        Returns:
-            float: Standard deviation of selection counts
-        """
-        selection_counts = list(self.selection_history.values())
-        return np.std(selection_counts)
-    
-    def get_selection_stats(self):
-        """
-        Get selection statistics
-        
-        Returns:
-            dict: Statistics about device selection
-        """
-        counts = list(self.selection_history.values())
-        return {
-            'mean_selections': np.mean(counts),
-            'std_selections': np.std(counts),
-            'min_selections': np.min(counts),
-            'max_selections': np.max(counts),
-            'fairness_score': self.get_fairness_score()
+
+    def get_stats(self):
+        stats = {}
+        for j in range(3):
+            counts = self.selection_counts[j]
+            stats[j] = {
+                'std': float(np.std(counts)),
+                'min': int(np.min(counts)),
+                'max': int(np.max(counts)),
+            }
+        return stats
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    print('=' * 70)
+    print('MULTI-JOB FEDCS SCHEDULER  (paper: Zhou et al. AAAI-22)')
+    print('=' * 70)
+
+    SEED = 42
+    torch.manual_seed(SEED); np.random.seed(SEED); random.seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'\nDevice : {device}')
+
+    NUM_DEVICES       = 100
+    DEVICES_PER_ROUND = 10
+    LOCAL_EPOCHS      = 5
+    BATCH_SIZE        = {0: 30, 1: 10, 2: 64}
+    LEARNING_RATE     = {0: 0.1, 1: 0.01, 2: 0.01}
+    MAX_ROUNDS        = 5000
+
+    JOBS = {
+        0: ('resnet18', 'cifar10',       3, 32, 54.6),
+        1: ('cnn_b',    'fashion_mnist', 1, 28, 82.1),
+        2: ('alexnet',  'mnist',         1, 28, 98.9),
+    }
+    JOB_NAMES = {
+        0: 'ResNet18 + CIFAR-10',
+        1: 'CNN-B  + FashionMNIST',
+        2: 'AlexNet  + MNIST',
+    }
+
+    print('\nJobs:')
+    for j, (m, d, _, _, t) in JOBS.items():
+        print(f'  Job {j}: {JOB_NAMES[j]:25s}  target={t}%')
+
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    print('\nCreating non-IID datasets (2 classes/device)...')
+    job_client_datasets = {}
+    job_test_datasets   = {}
+    for j, (_, dataset, _, _, _) in JOBS.items():
+        client_data, test_data = create_non_iid_datasets(
+            dataset, NUM_DEVICES, num_classes_per_device=2, seed=SEED + j
+        )
+        job_client_datasets[j] = client_data
+        job_test_datasets[j]   = test_data
+        print(f'  Job {j} ({dataset}): {len(test_data)} test samples')
+
+    # ── Models & servers ──────────────────────────────────────────────────────
+    print('\nInitialising models...')
+    servers = {}
+    for j, (model_key, _, ch, sz, _) in JOBS.items():
+        if model_key == 'resnet18':
+            model = ResNet18(num_classes=10, input_channels=ch)
+        elif model_key == 'cnn_b':
+            model = CNNB(num_classes=10)
+        elif model_key == 'alexnet':
+            model = AlexNet(num_classes=10, input_channels=ch, input_size=sz)
+        else:
+            raise ValueError(f'Unknown model: {model_key}')
+        servers[j] = FLServer(model.to(device), job_test_datasets[j], device=str(device))
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f'  Job {j}: {JOB_NAMES[j]:25s}  params={n_params:,}')
+
+    # ── Device capabilities ───────────────────────────────────────────────────
+    rng = np.random.default_rng(SEED)
+    device_caps = {
+        d: {
+            'capability':  float(rng.uniform(0.5, 2.0)),
+            'fluctuation': float(rng.uniform(0.1, 1.0)),
         }
-    
-    def get_selected_device_speeds(self):
-        """
-        Get average speed of selected vs non-selected devices
-        
-        Returns:
-            dict: Speed statistics
-        """
-        selected_speeds = []
-        not_selected_speeds = []
-        
-        for device_id, count in self.selection_history.items():
-            speed = self.device_speeds[device_id]
-            if count > 0:
-                selected_speeds.append(speed)
-            else:
-                not_selected_speeds.append(speed)
-        
-        return {
-            'selected_avg_speed': np.mean(selected_speeds) if selected_speeds else 0,
-            'not_selected_avg_speed': np.mean(not_selected_speeds) if not_selected_speeds else 0,
-            'num_selected_devices': len(selected_speeds),
-            'num_not_selected_devices': len(not_selected_speeds)
+        for d in range(NUM_DEVICES)
+    }
+
+    # ── Clients ───────────────────────────────────────────────────────────────
+    print(f'\nCreating {NUM_DEVICES} clients per job...')
+    clients = {}
+    for j in range(3):
+        clients[j] = {
+            d: FLClient(d, job_client_datasets[j][d],
+                        BATCH_SIZE[j], LEARNING_RATE[j], device)
+            for d in range(NUM_DEVICES)
         }
+        print(f'  Job {j}: {NUM_DEVICES} clients created')
+
+    # ── FedCS Selector ────────────────────────────────────────────────────────
+    print('\nInitialising FedCS selector...')
+    selector = FedCSSelector(NUM_DEVICES, DEVICES_PER_ROUND, device_caps, seed=SEED)
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    print('\n' + '=' * 70)
+    print('TRAINING')
+    print('=' * 70)
+
+    setup_plots()
+
+    log           = {j: {'rounds': [], 'acc': [], 'loss': []} for j in range(3)}
+    job_done      = {0: False, 1: False, 2: False}
+    job_times     = {0: 0.0,   1: 0.0,   2: 0.0}
+    job_rounds    = {0: 0,     1: 0,     2: 0}
+    job_final_acc = {0: 0.0,   1: 0.0,   2: 0.0}
+    round_num     = 0
+    global_start  = time.time()
+
+    with tqdm(total=MAX_ROUNDS, desc='FedCS') as pbar:
+        while not all(job_done.values()) and round_num < MAX_ROUNDS:
+            round_num += 1
+            occupied = set()
+
+            for j in range(3):
+                if job_done[j]:
+                    continue
+
+                selected = selector.select(j, occupied)
+                occupied.update(selected)
+
+                local_updates = [
+                    clients[j][d].train(servers[j].global_model, LOCAL_EPOCHS)
+                    for d in selected
+                ]
+                servers[j].aggregate(local_updates)
+                job_rounds[j] += 1
+
+                result = servers[j].evaluate()
+                acc  = result['test_accuracy']
+                loss = result['test_loss']
+                job_final_acc[j] = acc
+
+                update_plots(j, job_rounds[j], acc, loss)
+
+                log[j]['rounds'].append(job_rounds[j])
+                log[j]['acc'].append(acc)
+                log[j]['loss'].append(loss)
+
+                target = JOBS[j][4]
+                if acc >= target and not job_done[j]:
+                    job_done[j] = True
+                    job_times[j] = time.time() - global_start
+                    print(f'\n  ✓ Job {j} ({JOB_NAMES[j]}) reached {target}%'
+                          f' at round {job_rounds[j]}'
+                          f' ({job_times[j]/60:.1f} min)')
+
+            pbar.update(1)
+            if round_num % 20 == 0:
+                status = [f'J{j}:{job_final_acc[j]:.1f}%'
+                          for j in range(3) if not job_done[j]]
+                if status:
+                    pbar.set_postfix_str(' '.join(status))
+
+    save_plots()
+
+    os.makedirs('results', exist_ok=True)
+    log_path = 'results/fedcs_log.json'
+    with open(log_path, 'w') as f:
+        json.dump(log, f)
+    print(f'  Log saved -> {log_path}')
+
+    stats      = selector.get_stats()
+    total_time = sum(job_times.values())
+
+    print('\n' + '=' * 70)
+    print('FEDCS RESULTS')
+    print('=' * 70)
+    print(f'{"Job":<6} {"Model+Dataset":<26} {"Time (min)":>12} {"Rounds":>8} {"Acc":>8}')
+    print('-' * 70)
+    for j in range(3):
+        print(f'  {j}    {JOB_NAMES[j]:<26} '
+              f'{job_times[j]/60:>10.1f}   '
+              f'{job_rounds[j]:>6}   '
+              f'{job_final_acc[j]:>6.2f}%')
+    print('-' * 70)
+    print(f'  Total time: {total_time/60:.1f} min  ({total_time/3600:.2f} h)')
+
+    print('\nFairness (sigma of per-device selection counts):')
+    for j in range(3):
+        print(f'  Job {j}: sigma={stats[j]["std"]:.2f}  '
+              f'min={stats[j]["min"]}  max={stats[j]["max"]}')
+    print('=' * 70)
 
 
-
-if __name__ == "__main__":
-    import sys
-    import os
-    sys.path.insert(0,     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
-    
-    from utils.device_simulator import DeviceSimulator
-    
-    print("Testing FedCS Scheduler\n")
-    print("=" * 60)
-    
-    # Create device simulator to get capabilities
-    simulator = DeviceSimulator(num_devices=30, seed=42)
-    capabilities = simulator.get_capabilities()
-    
-    # Create FedCS scheduler
-    scheduler = FedCSScheduler(
-        num_devices=30,
-        devices_per_round=10,
-        device_capabilities=capabilities,
-        seed=42
-    )
-    
-    # Show device speeds
-    print("\nDevice Speeds (a_k):")
-    print("-" * 60)
-    speeds = [(i, capabilities[i]['a_k']) for i in range(30)]
-    speeds_sorted = sorted(speeds, key=lambda x: x[1])
-    
-    print("Fastest 5 devices:")
-    for dev_id, speed in speeds_sorted[:5]:
-        print(f"  Device {dev_id}: a_k = {speed:.3f}")
-    
-    print("\nSlowest 5 devices:")
-    for dev_id, speed in speeds_sorted[-5:]:
-        print(f"  Device {dev_id}: a_k = {speed:.3f}")
-    
-    # Simulate 10 rounds
-    print("\n" + "=" * 60)
-    print("SIMULATING 10 ROUNDS")
-    print("=" * 60)
-    
-    for round_num in range(10):
-        selected = scheduler.select_devices()
-        # Show average speed of selected devices
-        avg_speed = np.mean([scheduler.device_speeds[i] for i in selected])
-        print(f"Round {round_num+1}: Selected {len(selected)} devices, "
-              f"avg speed = {avg_speed:.3f}")
-    
-    # Show statistics
-    print("\n" + "=" * 60)
-    print("SELECTION STATISTICS")
-    print("=" * 60)
-    stats = scheduler.get_selection_stats()
-    print(f"Mean selections per device: {stats['mean_selections']:.2f}")
-    print(f"Std deviation: {stats['std_selections']:.2f}")
-    print(f"Min selections: {stats['min_selections']}")
-    print(f"Max selections: {stats['max_selections']}")
-    print(f"Fairness score: {stats['fairness_score']:.2f}")
-    
-    # Compare with random
-    print("\n" + "=" * 60)
-    print("SPEED ANALYSIS")
-    print("=" * 60)
-    speed_stats = scheduler.get_selected_device_speeds()
-    print(f"Devices selected at least once: {speed_stats['num_selected_devices']}")
-    print(f"Devices never selected: {speed_stats['num_not_selected_devices']}")
-    print(f"Average speed of selected devices: {speed_stats['selected_avg_speed']:.3f}")
-    if speed_stats['num_not_selected_devices'] > 0:
-        print(f"Average speed of ignored devices: {speed_stats['not_selected_avg_speed']:.3f}")
-    
-    # Show which devices never selected
-    never_selected = [i for i, count in scheduler.selection_history.items() if count == 0]
-    if never_selected:
-        print(f"\nDevices never selected ({len(never_selected)} devices):")
-        for dev_id in never_selected[:5]:  # Show first 5
-            print(f"  Device {dev_id}: a_k = {scheduler.device_speeds[dev_id]:.3f} (slow)")
-    
-    print("\n" + "=" * 60)
-    print("FedCS Scheduler working correctly!")
-    print("=" * 60)
-    print("\nKey observation: FedCS always selects fast devices")
-    print("This improves speed but hurts fairness!")
+if __name__ == '__main__':
+    main()
